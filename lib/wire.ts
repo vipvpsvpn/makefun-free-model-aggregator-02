@@ -462,3 +462,151 @@ export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8A
     for (const event of finishEvents(pendingStop ?? 'end_turn')) yield event;
   }
 }
+
+/** Anthropic's stream event names: a stream whose first data payload names one is a Messages stream. */
+const ANTHROPIC_STREAM_TYPES = new Set([
+  'message_start',
+  'content_block_start',
+  'content_block_delta',
+  'content_block_stop',
+  'message_delta',
+  'message_stop',
+  'error',
+  'ping',
+]);
+
+/** Whether a parsed JSON body is an Anthropic Messages document (not a Chat Completions one). */
+export function isAnthropicMessage(body: unknown): boolean {
+  return isRecord(body) && body.type === 'message' && Array.isArray(body.content);
+}
+
+/** An Anthropic stop_reason as a Chat Completions finish_reason. */
+function finishReasonOf(stop: unknown): string {
+  if (stop === 'max_tokens') return 'length';
+  if (stop === 'tool_use') return 'tool_calls';
+  if (stop === 'refusal') return 'content_filter';
+  return 'stop';
+}
+
+/** An Anthropic Messages document as a Chat Completions answer. `model` is the id the entry dialled. */
+export function anthropicMessageToOpenAI(body: Json, model: string): Json {
+  const content = Array.isArray(body.content) ? body.content : [];
+  const text = content.flatMap((b) => (isRecord(b) && b.type === 'text' && typeof b.text === 'string' ? [b.text] : [])).join('');
+  const calls: Json[] = [];
+  for (const block of content) {
+    if (!isRecord(block) || block.type !== 'tool_use') continue;
+    calls.push({
+      id: typeof block.id === 'string' ? block.id : 'toolu_unknown',
+      type: 'function',
+      function: { name: typeof block.name === 'string' ? block.name : '', arguments: JSON.stringify(isRecord(block.input) ? block.input : {}) },
+    });
+  }
+  const message: Json = { role: 'assistant', content: text === '' && calls.length > 0 ? null : text };
+  if (calls.length > 0) message.tool_calls = calls;
+  const usage = isRecord(body.usage) ? body.usage : {};
+  const out: Json = {
+    id: typeof body.id === 'string' ? body.id : 'chatcmpl_aggregate',
+    object: 'chat.completion',
+    created: 0,
+    model,
+    choices: [{ index: 0, message, logprobs: null, finish_reason: finishReasonOf(body.stop_reason) }],
+  };
+  if (isRecord(body.usage)) {
+    const promptTokens = numberOrZero(usage.input_tokens);
+    const completionTokens = numberOrZero(usage.output_tokens);
+    out.usage = { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: promptTokens + completionTokens };
+  }
+  return out;
+}
+
+/** Whether SSE text is an Anthropic Messages stream (its first data payload names a Messages event). */
+export function isAnthropicStream(text: string): boolean {
+  for (const line of text.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('data:')) continue;
+    const payload = trimmed.slice(5).trim();
+    if (payload === '' || payload === '[DONE]') continue;
+    try {
+      const doc: unknown = JSON.parse(payload);
+      if (isRecord(doc) && typeof doc.type === 'string' && ANTHROPIC_STREAM_TYPES.has(doc.type)) return true;
+      return false;
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
+/**
+ * An Anthropic Messages SSE stream as OpenAI Chat Completions SSE: the stream is assembled
+ * (text, tool calls, stop reason, usage) and re-emitted as one content chunk, one finish
+ * chunk carrying the usage, and [DONE]. Returns null when the stream is not a whole answer.
+ */
+export function anthropicStreamToOpenAI(text: string, model: string): string | null {
+  let content = '';
+  let stopReason = 'end_turn';
+  let usage: Json | null = null;
+  let started = false;
+  let stopped = false;
+  const calls: Json[] = [];
+  let toolId = '';
+  let toolName = '';
+  let toolInput = '';
+  for (const frame of text.split('\n\n')) {
+    for (const line of frame.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith('data:')) continue;
+      const payload = trimmed.slice(5).trim();
+      if (payload === '' || payload === '[DONE]') continue;
+      let doc: unknown;
+      try {
+        doc = JSON.parse(payload);
+      } catch {
+        return null;
+      }
+      if (!isRecord(doc)) return null;
+      const type = typeof doc.type === 'string' ? doc.type : '';
+      if (type === 'message_start') {
+        if (started) return null;
+        started = true;
+      } else if (type === 'content_block_delta' && isRecord(doc.delta)) {
+        if (doc.delta.type === 'text_delta' && typeof doc.delta.text === 'string') content += doc.delta.text;
+        else if (doc.delta.type === 'input_json_delta' && typeof doc.delta.partial_json === 'string') toolInput += doc.delta.partial_json;
+      } else if (type === 'content_block_start' && isRecord(doc.content_block) && doc.content_block.type === 'tool_use') {
+        toolId = typeof doc.content_block.id === 'string' ? doc.content_block.id : 'toolu_unknown';
+        toolName = typeof doc.content_block.name === 'string' ? doc.content_block.name : '';
+        toolInput = '';
+      } else if (type === 'content_block_stop' && toolName !== '') {
+        calls.push({ id: toolId, type: 'function', function: { name: toolName, arguments: toolInput } });
+        toolName = '';
+      } else if (type === 'message_delta') {
+        if (isRecord(doc.delta) && typeof doc.delta.stop_reason === 'string') stopReason = doc.delta.stop_reason;
+        if (isRecord(doc.usage)) usage = doc.usage;
+      } else if (type === 'message_stop') {
+        stopped = true;
+      } else if (type === 'error') {
+        return null;
+      }
+    }
+  }
+  if (!started || !stopped) return null;
+  const chunks: string[] = [];
+  const delta: Json = { role: 'assistant', content };
+  if (calls.length > 0) delta.tool_calls = calls;
+  chunks.push(`data: ${JSON.stringify({ id: 'chatcmpl_aggregate', object: 'chat.completion.chunk', created: 0, model, choices: [{ index: 0, delta, finish_reason: null }] })}\n\n`);
+  const finishChunk: Json = {
+    id: 'chatcmpl_aggregate',
+    object: 'chat.completion.chunk',
+    created: 0,
+    model,
+    choices: [{ index: 0, delta: {}, finish_reason: finishReasonOf(stopReason) }],
+  };
+  if (usage !== null) {
+    const promptTokens = numberOrZero(usage.input_tokens);
+    const completionTokens = numberOrZero(usage.output_tokens);
+    finishChunk.usage = { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: promptTokens + completionTokens };
+  }
+  chunks.push(`data: ${JSON.stringify(finishChunk)}\n\n`);
+  chunks.push('data: [DONE]\n\n');
+  return chunks.join('');
+}

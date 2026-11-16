@@ -72,8 +72,12 @@ import {
 import {
   anthropicError,
   anthropicEventsFromOpenAI,
+  anthropicMessageToOpenAI,
   anthropicModelList,
+  anthropicStreamToOpenAI,
   anthropicToOpenAI,
+  isAnthropicMessage,
+  isAnthropicStream,
   openAIError,
   openAIJsonWithModel,
   openAIModelList,
@@ -333,6 +337,33 @@ function cappedBody(body: Json): Json {
   return { ...body, max_tokens: DEFAULT_MAX_TOKENS };
 }
 
+/**
+ * The upstream bytes as an OpenAI answer: a Chat Completions body is passed through, a
+ * Messages body is translated. A gateway whose upstream speaks the Messages wire (the
+ * local grading lane does) answers in that shape, and the client wires below only read
+ * the OpenAI shape, so the translation has to happen here. Null when the body is not a
+ * readable answer in either shape: the prompt is lost, and no other model would answer
+ * in a different shape, so there is nothing to fail over to.
+ */
+function canonicalOpenAI(bytes: Uint8Array, stream: boolean, model: string): Uint8Array | null {
+  const text = Buffer.from(bytes).toString('utf8');
+  if (!stream) {
+    let doc: unknown;
+    try {
+      doc = JSON.parse(text);
+    } catch {
+      return null;
+    }
+    if (isAnthropicMessage(doc)) return Buffer.from(JSON.stringify(anthropicMessageToOpenAI(doc as Json, model)));
+    return bytes;
+  }
+  if (isAnthropicStream(text)) {
+    const converted = anthropicStreamToOpenAI(text, model);
+    return converted === null ? null : Buffer.from(converted);
+  }
+  return bytes;
+}
+
 /** A buffered gateway answer as a stream, for the wire relays. */
 function streamOf(bytes: Uint8Array): ReadableStream<Uint8Array> {
   return new Response(bytes).body as ReadableStream<Uint8Array>;
@@ -358,10 +389,12 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const result = await dialWithFailover((model) => cappedBody({ ...body, model }), requires, index);
   if (!('model' in result)) return refused(res, 'openai', result.failures);
   const header = failuresHeader(result.failures);
+  const canonical = canonicalOpenAI(result.bytes, body.stream === true, result.model);
+  if (canonical === null) return sendError(res, 'openai', 502, 'upstream_error', 'the gateway answered in a shape this server cannot read', header);
   if (body.stream === true) {
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive', ...header });
     try {
-      for await (const frame of openAIStreamWithModel(streamOf(result.bytes), result.model)) res.write(frame);
+      for await (const frame of openAIStreamWithModel(streamOf(canonical), result.model)) res.write(frame);
     } finally {
       res.end();
     }
@@ -369,7 +402,7 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
   }
   let answer: unknown;
   try {
-    answer = JSON.parse(Buffer.from(result.bytes).toString('utf8'));
+    answer = JSON.parse(Buffer.from(canonical).toString('utf8'));
   } catch {
     return sendError(res, 'openai', 502, 'upstream_error', 'the gateway answered with a body that is not JSON', header);
   }
@@ -384,10 +417,12 @@ async function messages(req: IncomingMessage, res: ServerResponse): Promise<void
   const result = await dialWithFailover((model) => cappedBody(anthropicToOpenAI(body, model)), requires, index);
   if (!('model' in result)) return refused(res, 'anthropic', result.failures);
   const header = failuresHeader(result.failures);
+  const canonical = canonicalOpenAI(result.bytes, body.stream === true, result.model);
+  if (canonical === null) return sendError(res, 'anthropic', 502, 'api_error', 'the gateway answered in a shape this server cannot read', header);
   if (body.stream === true) {
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive', ...header });
     try {
-      for await (const event of anthropicEventsFromOpenAI(streamOf(result.bytes), result.model)) res.write(event);
+      for await (const event of anthropicEventsFromOpenAI(streamOf(canonical), result.model)) res.write(event);
     } finally {
       res.end();
     }
@@ -395,7 +430,7 @@ async function messages(req: IncomingMessage, res: ServerResponse): Promise<void
   }
   let answer: unknown;
   try {
-    answer = JSON.parse(Buffer.from(result.bytes).toString('utf8'));
+    answer = JSON.parse(Buffer.from(canonical).toString('utf8'));
   } catch {
     return sendError(res, 'anthropic', 502, 'api_error', 'the gateway answered with a body that is not JSON', header);
   }
