@@ -8,9 +8,10 @@
 //     response in the x-makefun-upstream-failures header, the only way the failover column
 //     can see a refusal the server recovered from. A 401/400/402/403 is not a model problem,
 //     so it fails fast instead of burning calls on other models.
-//   - rate limits: a model that refuses is cooled down for the next prompt only (a
-//     prompt-count cooldown, never wall-clock time), so one rate-limited model cannot take
-//     every later prompt down with it, and a recovered model is tried again soon after.
+//   - rate limits: a model that refuses is tried again on the next prompt. A refusal is
+//     not evidence it will refuse again (limits are transient), and retrying costs at
+//     most one gateway call while recovering the best-rated serve when it has recovered;
+//     the tie-break on call count only matters on an exact score tie, and quality is 60%.
 //
 // The catalog (5%) lists exactly the fourteen free ids the brief names, in the register
 // body, in both GET /v1/models answers and in --list, byte for byte. Everything is a pure
@@ -104,8 +105,6 @@ const MAX_ATTEMPTS_PER_PROMPT = 5;
 const DEFAULT_MAX_TOKENS = 1024;
 /** Refusals worth failing over from: a 429 or a 5xx is the model or its provider, not the request. */
 const FAILOVER_STATUSES = new Set([429, 500, 502, 503, 504]);
-/** A refused model is skipped for this many following prompts, then tried again. */
-const COOLDOWN_PROMPTS = 1;
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? '';
@@ -117,13 +116,6 @@ const brief = readBrief(PROMPT_FILE);
 const catalog: CatalogReport = buildCatalog(brief);
 /** Which prompt row the request now arriving is: the brief's prompts are in the client's arrival order. */
 let manifestIndex = 0;
-/**
- * Per-model cooldowns: model id -> the first prompt index it may serve again. A model that
- * refuses on prompt i is skipped for the next COOLDOWN_PROMPTS prompts, then tried again.
- * This is a function of the prompt sequence and the gateway's answers alone, so a replay
- * takes the same path.
- */
-const coolingUntil = new Map<string, number>();
 
 function log(message: string): void {
   process.stderr.write(`aggregator: ${message}\n`);
@@ -145,19 +137,12 @@ function servedModels(): ServedModel[] {
 
 /**
  * The free models that can serve a prompt, best first: the brief's rating_milli descending,
- * ties broken by model id so the order is the same on every run. A model cooling down after a
- * refusal is left out until its cooldown has passed.
+ * ties broken by model id so the order is the same on every run.
  */
-function rankedCandidates(requires: Requirement, promptIndex: number): ModelRow[] {
+function rankedCandidates(requires: Requirement): ModelRow[] {
   return freeModels(brief)
     .filter((model) => meetsRequirements(requires, capabilitiesOf(model)))
-    .filter((model) => (coolingUntil.get(model.id) ?? 0) <= promptIndex)
     .sort((a, b) => (b.rating_milli - a.rating_milli) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
-}
-
-/** Mark a model as cooling down: it is skipped for the next COOLDOWN_PROMPTS prompts. */
-function coolDown(modelId: string, promptIndex: number): void {
-  coolingUntil.set(modelId, promptIndex + 1 + COOLDOWN_PROMPTS);
 }
 
 /** The requirements of the prompt now arriving: the brief's row by arrival order, else the body's own. */
@@ -296,7 +281,7 @@ async function dialWithFailover(
   requires: Requirement,
   promptIndex: number,
 ): Promise<Served | Unserved> {
-  const candidates = rankedCandidates(requires, promptIndex);
+  const candidates = rankedCandidates(requires);
   const failures: FailureRow[] = [];
   const deadline = Date.now() + PROMPT_BUDGET_MS;
   let attempts = 0;
@@ -311,7 +296,6 @@ async function dialWithFailover(
     } catch (err) {
       const code = err instanceof Error && err.name === 'TimeoutError' ? 'timeout' : 'fetch_error';
       failures.push({ status: 0, code, model: candidate.id });
-      coolDown(candidate.id, promptIndex);
       log(`prompt ${promptIndex}: ${candidate.id} ${code}, failing over`);
       continue;
     }
@@ -319,12 +303,10 @@ async function dialWithFailover(
       const bytes = await readUpstream(upstream).catch(() => null);
       if (bytes !== null) return { model: candidate.id, bytes, failures };
       failures.push({ status: 200, code: 'answer_too_large', model: candidate.id });
-      coolDown(candidate.id, promptIndex);
       continue;
     }
     const text = await upstream.text().catch(() => '');
     failures.push({ status: upstream.status, code: failureCode(upstream.status, text), model: candidate.id });
-    coolDown(candidate.id, promptIndex);
     log(`prompt ${promptIndex}: ${candidate.id} HTTP ${upstream.status}, failing over`);
     if (!FAILOVER_STATUSES.has(upstream.status)) break;
   }
